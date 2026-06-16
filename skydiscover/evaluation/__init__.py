@@ -26,11 +26,14 @@ from skydiscover.evaluation.evaluator import Evaluator
 from skydiscover.evaluation.harbor_evaluator import HarborEvaluator
 from skydiscover.evaluation.llm_judge import LLMJudge
 
+from skydiscover.evaluation.chia_evaluator import ChiaEvaluator
+
 __all__ = [
     "EvaluationResult",
     "Evaluator",
     "ContainerizedEvaluator",
     "HarborEvaluator",
+    "ChiaEvaluator",
     "LLMJudge",
     "create_evaluator",
 ]

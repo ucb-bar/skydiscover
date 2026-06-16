@@ -156,7 +156,13 @@ class OpenAILLM(LLMInterface):
                 params["top_p"] = top_p
             reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
             if reasoning_effort is not None:
-                params["reasoning_effort"] = reasoning_effort
+                api_base_lower = (self.api_base or "").lower()
+                is_openai_host = (
+                    any(api_base_lower.startswith(p) for p in _OPENAI_API_PREFIXES)
+                    or ".openai.azure.com" in api_base_lower
+                )
+                if is_openai_host:
+                    params["reasoning_effort"] = reasoning_effort
 
         # Add response_format if requested (e.g. {"type": "json_object"})
         response_format = kwargs.get("response_format")
@@ -204,7 +210,17 @@ class OpenAILLM(LLMInterface):
                 error_text_parts.append(str(response_text))
 
         error_text = " ".join(error_text_parts).lower()
-        return "response_format" in error_text or "response format" in error_text
+        return any(
+            kw in error_text
+            for kw in (
+                "response_format",
+                "response format",
+                "additionalproperties",
+                "json_schema",
+                "json schema",
+                "\"strict\"",
+            )
+        )
 
     def _maybe_downgrade_response_format(
         self, params: Dict[str, Any], error: Exception
@@ -235,8 +251,15 @@ class OpenAILLM(LLMInterface):
             )
             return response.choices[0].message.content
         except (openai.BadRequestError, openai.APIStatusError) as exc:
-            # Some Azure deployments only expose the Responses API.
-            # Fall back transparently when Chat Completions is unsupported.
+            # Some Azure/OpenAI deployments only expose the Responses API.
+            # Only fall back for hosts that actually have one.
+            api_base_lower = (self.api_base or "").lower()
+            has_responses_api = (
+                any(api_base_lower.startswith(p) for p in _OPENAI_API_PREFIXES)
+                or ".openai.azure.com" in api_base_lower
+            )
+            if not has_responses_api:
+                raise
             if "unsupported" not in str(exc).lower() and "not found" not in str(exc).lower():
                 raise
             logger.info("Chat Completions unsupported; falling back to Responses API")
@@ -246,7 +269,7 @@ class OpenAILLM(LLMInterface):
         """Translate a Chat-Completions-style *params* dict into a Responses API
         call and return the assistant text."""
         messages = params.get("messages", [])
-        input_items = self._convert_to_responses_input(
+        input_items = convert_messages_to_responses_input(
             [m for m in messages if m.get("role") != "system"]
         )
         system_msg = next((m["content"] for m in messages if m.get("role") == "system"), None)
@@ -269,7 +292,7 @@ class OpenAILLM(LLMInterface):
         response = await loop.run_in_executor(
             None, lambda: self.client.responses.create(**resp_params)
         )
-        text, _ = self._extract_responses_output(response)
+        text, _, _ = extract_responses_output(response)
         return text or ""
 
     def _resolve_retry_options(self, **kwargs) -> Tuple[int, int, int]:
