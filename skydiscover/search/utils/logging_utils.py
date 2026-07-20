@@ -44,23 +44,62 @@ class _ConsoleFilter(logging.Filter):
 
 
 def setup_search_logging(log_level: str, log_dir: str, name: str) -> None:
-    """Configure root logger with a timestamped file handler and a console handler."""
+    """Configure logging with a timestamped file handler and a console handler.
+
+    Handlers are placed on the ``skydiscover`` named logger with
+    ``propagate=False`` so that Ray's root-level StreamHandler (or any
+    other framework handler on root) does not duplicate console output.
+    """
     os.makedirs(log_dir, exist_ok=True)
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, log_level))
+    level = getattr(logging, log_level)
 
     log_file = os.path.join(log_dir, f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.log")
-    fh = logging.FileHandler(log_file)
-    fh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    root.addHandler(fh)
+    fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-    if not any(
-        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-        for h in root.handlers
-    ):
-        ch = logging.StreamHandler()
-        ch.setFormatter(_ConsoleFormatter())
-        ch.addFilter(_ConsoleFilter())
-        root.addHandler(ch)
+    # Root: file-only (no StreamHandler). Non-skydiscover messages still
+    # reach the log file; _ConsoleFilter already suppressed them on console.
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+        h.close()
+    root.setLevel(level)
+    fh_root = logging.FileHandler(log_file)
+    fh_root.setFormatter(fmt)
+    root.addHandler(fh_root)
+
+    # 'skydiscover' logger: file + console, propagate=False.
+    sky = logging.getLogger("skydiscover")
+    for h in sky.handlers[:]:
+        sky.removeHandler(h)
+        h.close()
+    sky.setLevel(level)
+    sky.propagate = False
+
+    fh_sky = logging.FileHandler(log_file)
+    fh_sky.setFormatter(fmt)
+    sky.addHandler(fh_sky)
+
+    ch = logging.StreamHandler()
+    ch.setFormatter(_ConsoleFormatter())
+    ch.addFilter(_ConsoleFilter())
+    sky.addHandler(ch)
+
+    # 'evolve_flows' logger: same pattern as 'skydiscover' — file + console,
+    # propagate=False.  Prevents duplication when Ray (or another framework)
+    # reinstates a StreamHandler on root after we strip it above.
+    ef = logging.getLogger("evolve_flows")
+    for h in ef.handlers[:]:
+        ef.removeHandler(h)
+        h.close()
+    ef.setLevel(level)
+    ef.propagate = False
+
+    fh_ef = logging.FileHandler(log_file)
+    fh_ef.setFormatter(fmt)
+    ef.addHandler(fh_ef)
+
+    ch_ef = logging.StreamHandler()
+    ch_ef.setFormatter(_ConsoleFormatter())
+    ef.addHandler(ch_ef)
 
     logging.getLogger(__name__).info(f"Logging to {log_file}")

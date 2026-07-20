@@ -13,6 +13,7 @@ Features:
 - Comprehensive JSON logging of all AdaEvolve signals
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from skydiscover.context_builder.adaevolve import AdaEvolveContextBuilder
 from skydiscover.context_builder.default import DefaultContextBuilder
@@ -68,8 +69,7 @@ class AdaEvolveController(DiscoveryController):
         self.max_retries = getattr(db_config, "max_error_retries", 2)
         self.num_context_programs = self.config.search.num_context_programs
 
-        # Components
-        self.llms = LLMPool(self.config.llm.models)
+        # Components (self.llms already created by super().__init__)
         self.context_builder = AdaEvolveContextBuilder(self.config)
 
         # Paradigm generator (if paradigm breakthrough is enabled)
@@ -230,18 +230,43 @@ class AdaEvolveController(DiscoveryController):
         checkpoint_callback=None,
     ) -> Optional[Program]:
         """Run evolution with adaptive search intensity and island rotation."""
-        total = start_iteration + max_iterations
         logger.info(
             f"AdaEvolve: Running {max_iterations} iterations "
             f"across {self.database.num_islands} islands"
         )
 
-        # Set up comprehensive JSON logging for iteration stats
         self._setup_iteration_stats_logging()
-
-        # Ensure all islands are seeded
         self._ensure_all_islands_seeded()
 
+        max_parallel = self.config.max_parallel_iterations
+        if max_parallel > 1:
+            await self._run_discovery_parallel(
+                start_iteration, max_iterations, checkpoint_callback, max_parallel,
+            )
+        else:
+            await self._run_discovery_sequential(
+                start_iteration, max_iterations, checkpoint_callback,
+            )
+
+        logger.info("AdaEvolve completed")
+        self.database.log_status()
+
+        if self._iteration_stats_log_path:
+            logger.info(f"AdaEvolve iteration stats saved to: {self._iteration_stats_log_path}")
+
+        return self.database.get_best_program()
+
+    # ------------------------------------------------------------------
+    # Sequential loop (max_parallel_iterations == 1)
+    # ------------------------------------------------------------------
+
+    async def _run_discovery_sequential(
+        self,
+        start_iteration: int,
+        max_iterations: int,
+        checkpoint_callback=None,
+    ) -> None:
+        total = start_iteration + max_iterations
         for iteration in range(start_iteration, total):
             if self.shutdown_event.is_set():
                 logger.info("Shutdown requested")
@@ -252,18 +277,67 @@ class AdaEvolveController(DiscoveryController):
             except Exception as e:
                 logger.exception(f"Iteration {iteration} failed: {e}")
             finally:
-                # CRITICAL: Tell database iteration is complete
-                # This handles island rotation (UCB) and migration
                 self.database.end_iteration(iteration)
 
-        logger.info("AdaEvolve completed")
-        self.database.log_status()
+    # ------------------------------------------------------------------
+    # Parallel loop (max_parallel_iterations > 1)
+    # ------------------------------------------------------------------
 
-        # Log final summary and stats file location
-        if self._iteration_stats_log_path:
-            logger.info(f"AdaEvolve iteration stats saved to: {self._iteration_stats_log_path}")
+    async def _run_discovery_parallel(
+        self,
+        start_iteration: int,
+        max_iterations: int,
+        checkpoint_callback=None,
+        max_parallel: int = 4,
+    ) -> None:
+        total = start_iteration + max_iterations
+        sem = asyncio.Semaphore(max_parallel)
+        pending: set = set()
 
-        return self.database.get_best_program()
+        logger.info(
+            f"AdaEvolve parallel: up to {max_parallel} iterations in flight "
+            f"({start_iteration}..{total - 1})"
+        )
+
+        async def _bounded_iteration(iteration: int) -> Tuple[int, bool]:
+            async with sem:
+                if self.shutdown_event.is_set():
+                    return iteration, False
+                try:
+                    await self._run_iteration(iteration, checkpoint_callback)
+                except Exception as e:
+                    logger.exception(f"Iteration {iteration} failed: {e}")
+                finally:
+                    self.database.end_iteration(iteration)
+            return iteration, True
+
+        for iteration in range(start_iteration, total):
+            if self.shutdown_event.is_set():
+                break
+
+            task = asyncio.create_task(
+                _bounded_iteration(iteration), name=f"adaevolve_iter_{iteration}",
+            )
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
+            if len(pending) >= max_parallel:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in done:
+                    try:
+                        t.result()
+                    except Exception as e:
+                        logger.warning(f"Parallel iteration task failed: {e}")
+
+        if pending:
+            done, _ = await asyncio.wait(pending)
+            for t in done:
+                try:
+                    t.result()
+                except Exception as e:
+                    logger.warning(f"Parallel iteration task (drain) failed: {e}")
 
     def _ensure_all_islands_seeded(self) -> None:
         """Ensure all islands have at least one program."""
@@ -310,26 +384,34 @@ class AdaEvolveController(DiscoveryController):
 
         iteration_time = time.time() - iteration_start_time
 
+        # Use per-result values (safe under concurrency); fall back to self._last_*
+        # for backward compat (e.g. from-scratch bootstrap path).
+        sampling_mode = result.sampling_mode or self._last_sampling_mode
+        sampling_intensity = result.sampling_intensity if result.sampling_intensity is not None else self._last_sampling_intensity
+
         if result.error:
             logger.warning(f"Iteration {iteration}: {result.error}")
-            # Log failed iteration stats
             self._log_iteration_stats(
                 iteration=iteration,
-                sampling_mode=self._last_sampling_mode,
-                sampling_intensity=self._last_sampling_intensity,
+                sampling_mode=sampling_mode,
+                sampling_intensity=sampling_intensity,
                 child_program=None,
                 iteration_time=iteration_time,
                 llm_generation_time=result.llm_generation_time,
                 eval_time=result.eval_time,
                 error=result.error,
             )
+            if self.monitor_callback:
+                try:
+                    self.monitor_callback(None, iteration)
+                except Exception:
+                    logger.debug("Monitor callback error", exc_info=True)
         else:
             self._process_result(result, iteration, checkpoint_callback)
-            # Log successful iteration stats
             self._log_iteration_stats(
                 iteration=iteration,
-                sampling_mode=self._last_sampling_mode,
-                sampling_intensity=self._last_sampling_intensity,
+                sampling_mode=sampling_mode,
+                sampling_intensity=sampling_intensity,
                 child_program=result.child_program_dict,
                 iteration_time=result.iteration_time,
                 llm_generation_time=result.llm_generation_time,
@@ -495,15 +577,17 @@ class AdaEvolveController(DiscoveryController):
             # Read sampling mode stashed by database.sample()
             sampling_mode = getattr(self.database, "_last_sampling_mode", None) or "balanced"
 
-            # Capture sampling mode and intensity for logging
+            # Capture sampling mode and intensity as locals (safe under concurrency).
+            # Also stash on self for backward compat with sequential path.
             self._last_sampling_mode = sampling_mode
             current_island = self.database.current_island
             if self.database.use_adaptive_search:
-                self._last_sampling_intensity = self.database.adapter.get_search_intensity(
+                sampling_intensity = self.database.adapter.get_search_intensity(
                     current_island
                 )
             else:
-                self._last_sampling_intensity = self.database.fixed_intensity
+                sampling_intensity = self.database.fixed_intensity
+            self._last_sampling_intensity = sampling_intensity
 
             # When paradigm is active, use best program as parent
             # This ensures paradigm (designed from best) is applied to best, not random parent
@@ -568,7 +652,7 @@ class AdaEvolveController(DiscoveryController):
                     self.feedback_reader.log_usage(iteration, feedback, self.feedback_reader.mode)
 
             # Generate and evaluate
-            return await self._execute_generation(
+            result = await self._execute_generation(
                 parent,
                 prompt,
                 iteration,
@@ -577,6 +661,9 @@ class AdaEvolveController(DiscoveryController):
                 context_program_ids=context_program_ids,
                 other_context_programs=context_programs_dict,
             )
+            result.sampling_mode = sampling_mode
+            result.sampling_intensity = sampling_intensity
+            return result
 
         except Exception as e:
             logger.exception(f"Generation failed: {e}")

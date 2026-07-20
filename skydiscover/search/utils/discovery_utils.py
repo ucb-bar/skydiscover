@@ -72,6 +72,10 @@ class SerializableResult:
     error: Optional[str] = None
     attempts_used: int = 1
 
+    # AdaEvolve: captured at sample-time so parallel iterations log correctly.
+    sampling_mode: Optional[str] = None
+    sampling_intensity: Optional[float] = None
+
 
 def load_database_from_file(
     file_path: str,
