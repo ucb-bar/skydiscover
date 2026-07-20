@@ -774,7 +774,7 @@ class AdaEvolveDatabase(ProgramDatabase):
         - Island selection (UCB with decayed magnitude rewards OR round-robin)
         - Migration (at interval)
         """
-        self._iteration_count = iteration
+        self._iteration_count = max(self._iteration_count, iteration)
 
         # Check if we should spawn a new island
         if self._should_spawn_island():

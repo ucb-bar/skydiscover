@@ -483,6 +483,8 @@ async def run(
     output_dir: str,
     monitor_callback: Optional[Callable] = None,
     feedback_reader: Optional[Any] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+    status_callback: Optional[Callable] = None,
 ) -> DiscoveryResult:
     """Run evolution using AlphaEvolve's cloud API.
 
@@ -538,14 +540,42 @@ async def run(
     experiment.create_initial_program(initial_program)
     experiment.start_experiment()
 
-    # 6. Run controller loop
-    # Directly await -- do NOT use asyncio.run()
-    await run_controller_loop(
+    # 6. Run controller loop with stop/status polling
+    import asyncio as _asyncio
+
+    controller_task = _asyncio.create_task(run_controller_loop(
         experiment,
         num_samplers=ae_config.get("num_samplers", 1),
         num_evaluators=num_evaluators,
         idle_timeout_s=ae_config.get("idle_timeout_s", 120),
-    )
+    ))
+
+    last_evaluated = 0
+    try:
+        while not controller_task.done():
+            await _asyncio.sleep(0.5)
+
+            stats = experiment.stats
+            evaluated = stats.get("num_programs_evaluated", 0)
+
+            if status_callback and evaluated != last_evaluated:
+                last_evaluated = evaluated
+                status_callback(evaluated)
+
+            if stop_check and stop_check():
+                current = stats.get("num_programs_evaluated", 0)
+                logger.warning(
+                    "Stop requested: overriding max_programs_evaluated "
+                    "from %d to %d to halt the experiment.",
+                    experiment.max_programs_evaluated,
+                    current,
+                )
+                experiment.max_programs_evaluated = current
+    except _asyncio.CancelledError:
+        controller_task.cancel()
+        raise
+
+    await controller_task
 
     # 7. Post-loop submission gap check
     stats = experiment.stats
