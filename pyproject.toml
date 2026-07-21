@@ -15,6 +15,7 @@ dependencies = [
     "tqdm>=4.64.0",
     "numpy>=1.22.0",
     "python-dotenv>=1.2.1",
+    "alpha-evolve",
 ]
 
 [project.optional-dependencies]
@@ -45,7 +46,6 @@ external = [
     "openevolve",
     "gepa[full]",
     "litellm>=1.81",  # gepa[full] needs litellm, but uv override-dependencies strips the [full] extra
-    "alpha-evolve",
 ]
 dev = [
     "pytest>=7.0.0",
